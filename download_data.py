@@ -5,7 +5,7 @@
 #       Gets a list of all studies on source Orthanc
 #       Downloads each study to zip archive in target s3 bucket (named by the unique Orthanc uuid)
 
-cred = '<user-password>' # orthanc credentials
+cred = '<user-password>' # orthanc credentials ('username:password')
 ip = '<ip-address>'
 port = '<dicom-port>'
 
