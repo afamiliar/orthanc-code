@@ -1,24 +1,29 @@
 import json
-import requests
+import logging
 import os
 import zipfile
+
+import requests
 import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def get_orthanc_url(flag):
-    if flag == 'AWS':
-        cred = 
-        ip = 
-        port = 
-    if flag == 'HPC':
-        cred = 
-        ip = 
-        port = 
-    if flag == 'K8':
-        cred=
-        ip=
-        port=
-    return 'http://'+cred+'@'+ip+':'+port
+from image_deid_etl.exceptions import ImproperlyConfigured
+
+logger = logging.getLogger(__name__)
+
+ORTHANC_CREDENTIALS = os.getenv("ORTHANC_CREDENTIALS")
+if ORTHANC_CREDENTIALS is None:
+    raise ImproperlyConfigured("You must supply ORTHANC_CREDENTIALS.")
+
+ORTHANC_HOST = os.getenv("ORTHANC_HOST")
+if ORTHANC_HOST is None:
+    raise ImproperlyConfigured("You must supply ORTHANC_HOST.")
+
+ORTHANC_PORT = os.getenv("ORTHANC_PORT", 80)
+
+def get_orthanc_url():
+    return f"http://{ORTHANC_CREDENTIALS}@{ORTHANC_HOST}:{ORTHANC_PORT}"
 
 def all_study_uuids(orthanc_url):
 # get a list of all study uuids for a given instance
@@ -43,24 +48,37 @@ def get_uuids_from_mrn(orthanc_url,mrn):
     resp = requests.post(orthanc_url+'/tools/find', data=data_json, verify=False)
     return resp.json()
 
+def get_patient_uuid_from_mrn(orthanc_url, mrn):
+    data = {'Level':'Patient',
+            'Query':{'PatientID':str(mrn)} }
+    data_json = json.dumps(data)
+    resp = requests.post(orthanc_url+'/tools/find', data=data_json, verify=False)
+    return resp.json()
+
 def get_uuids(orthanc_url,accession_df,in_type):
     out_list = []
     missing_list=[]
     df_col=[]
-    for ind,row in accession_df.iterrows():
-        if in_type=='accession':
-            unique_id = row['accession_num']
-            uuids = get_uuids_from_accession(orthanc_url,unique_id)
-        elif in_type=='mrn':
-            unique_id = row['MRN']
-            uuids = get_uuids_from_mrn(orthanc_url,unique_id)
+    if in_type=='all':
+        uuids = all_study_uuids(orthanc_url)
+        out_list = list(set(uuids)-set(accession_df)) # find any new uuids
+        accession_df=[]
+    else:
+        for ind,row in accession_df.iterrows():
+            if in_type=='accession':
+                unique_id = row['accession_num']
+                uuids = get_uuids_from_accession(orthanc_url,unique_id)
+            elif in_type=='mrn':
+                unique_id = row['MRN']
+                uuids = get_uuids_from_mrn(orthanc_url,unique_id)
         if uuids:
             df_col.append(uuids)
             out_list = out_list + uuids
         else:
             df_col.append([' '])
             missing_list.append(unique_id)
-    accession_df['uuids']=df_col
+        accession_df['uuids']=df_col
+
     return out_list,missing_list,accession_df
 
 def get_study_metadata(orthanc_url,uuid):
@@ -72,41 +90,6 @@ def get_series_metadata(orthanc_url,uuid):
 
 def get_patient_metadata(orthanc_url,uuid):
     return requests.get(orthanc_url+'/patients/'+uuid+'/', verify=False).json()
-
-def get_dicom_field(orthanc_url,input_df,field):
-# get a specific field in the study metadata (e.g., 'StudyDate') for an input_df of accession numbers
-# returns a df with a new column for the field-of-interest
-    fields=[]
-    found=0
-    for index,row in input_df.iterrows():
-        # get Orthanc UUID based on accession number
-        access_num = str(row['accession_num'])
-        uuids = get_uuids_from_accession(orthanc_url,access_num)
-        if len(uuids) == 0: # no uuids found
-            fields.append([' ',' ',' '])
-        else:
-            if len(uuids) > 1: # if more than one uuid for this accession
-                field_list=[]
-                for uuid in uuids:
-                    info = get_study_metadata(orthanc_url,uuid)
-                    field_list.append(info["MainDicomTags"][field])
-                fields.append([access_num,uuids,field_list])
-                found=1
-            else:
-                uuid = uuids[0]
-                info = get_study_metadata(orthanc_url,uuid)
-                field_value = info["MainDicomTags"][field]
-                fields.append([access_num,uuid,field_value])
-                found=1
-    if found: # if there's at least found
-        dates_df = pd.DataFrame(fields,columns=["accession_num","uuid",field])
-        if field == 'StudyDate':
-            dates_df[field] = dates_df[field].astype(str).apply(lambda x: x[0:4]+'-'+x[4:6]+'-'+x[6:8] if (x != 'nan') else x) # reformat 19990101 to 1999-01-01
-        input_df['accession_num'] = input_df['accession_num'].astype('str')
-        output_df = pd.merge(input_df,dates_df,on='accession_num',how='left')
-        return output_df
-    else:
-        return input_df
 
 def all_instance_mrns(orthanc_url):
 # get a list of mrns for all studies on a given instance
@@ -130,7 +113,7 @@ def all_instance_accessions(orthanc_url):
             all_accessions.append(accession_num)
     return all_accessions
 
-def compare_s3_orthanc(orthanc_url,s3_path):
+def compare_s3_orthanc(orthanc_cred,orthanc_ip,orthanc_port,s3_path):
 # compares uuids between processed data in S3 bucket & Orthanc
 #   returns [list of uuids to process] if not matching & more data on Orthanc (trigger for pipeline)
 #   returns 0 if matching, or not matching & more data on S3
@@ -146,44 +129,59 @@ def compare_s3_orthanc(orthanc_url,s3_path):
         fn = file.strip('.zip\n')
         s3_uuids.append(fn)
 
-    ## get list of uuids on Orthanc
-    orthanc_uuids = all_study_uuids(orthanc_url)
+    ## create local text file with list of uuids on Orthanc & load the list
+    localhost=orthanc_cred+'@'+orthanc_ip
+    os.system('curl -s -k https://'+localhost+':'+orthanc_port+'/studies > all_study_uuids_'+orthanc_ip+'.json')
+    with open('all_study_uuids_'+orthanc_ip+'.json') as data_file:
+        orthanc_uuids = json.load(data_file)
 
-    # compare the 2 lists, if more files on Orthanc, return list of uuids for the next process
-    out_list = list(set(orthanc_uuids)-set(s3_uuids))
-    if out_list:
-        return out_list
+    # sort in order to compare
+    s3_uuids.sort()
+    orthanc_uuids.sort()
+
+    # compare the 2 lists, if not matching & more files on Orthanc, return list of uuids for the next process
+    if s3_uuids != orthanc_uuids:
+        if len(s3_uuids) < len(orthanc_uuids): # new data in Orthanc
+            out_list = []
+            for i in orthanc_uuids:
+                if i not in s3_uuids:
+                    out_list.append(i)
+            return out_list
+        else:
+            return 0
     else:
         return 0
 
-def download_study(orthanc_url,uuid,output_path):
-# download a single study archive to local disk based on uuid
-    os.system('curl -s -k '+orthanc_url+'/studies/'+uuid+'/archive > '+output_path)
 
-def download_unpack_copy(orthanc_url,s3_path,uuids,data_dir):
-# downloads data from Orthanc based on list of uuids as "{uuid}.zip"
-#   copies .zip to s3/backup
-#   unpacks .zip & deletes it locally
-# restricted to "MR" modality studies only
-    processed=[]
+def download_unpack_copy(orthanc_url, uuid, data_dir, ses_mod_to_skip):
+    """Download and unpack a specified study from Orthanc"""
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
-    for uuid in uuids:
-        info = get_series_metadata(orthanc_url,uuid)
-        modality = info[0]['MainDicomTags']['Modality']
-        output_fn = uuid+'.zip'
-        output_path = data_dir+output_fn
-        ## download this archive
-        download_study(orthanc_url,uuid,output_path)
-        ## copy backup to s3
-        os.system('aws s3 cp '+output_path+' '+s3_path+'DICOMs/backup/')
-        ## unpack it
+
+    info = get_series_metadata(orthanc_url,uuid)
+    if 'HttpError' in info:
+        raise AttributeError(
+            "Unable to retrieve study UUID from Orthanc. Invalid study UUID? Orthanc instance up and running?"
+            )
+        sys.exit(1)
+    modality = info[0]['MainDicomTags']['Modality']
+    if modality not in ses_mod_to_skip:
+        output_path = f"{data_dir}{uuid}.zip"
+
+        # Download the study archive from Orthanc.
+        if not os.path.exists(output_path):
+            logger.info("Downloading study %s...", uuid)
+            os.system(f"curl -s -k {orthanc_url}/studies/{uuid}/archive > {output_path}")
+        else:
+            logger.info("Already downloaded study %s. Skipping download.", uuid)
+
+        # Unpack the study archive.
+        logger.info("Extracting study %s...", uuid)
         with zipfile.ZipFile(output_path, 'r') as zip_ref:
             zip_ref.extractall(data_dir)
-        ## delete local zip
-        os.remove(output_path)
-        processed.append(uuid)
-    return processed
+    else:
+        # E.g., Skip digital radiography or ultrasound images.
+        logger.info("Not downloading study %s; skipping modality %s.", uuid, modality)
 
 # the following code is to upload a .zip to an Orthanc instance
 #   modified from: https://hg.orthanc-server.com/orthanc/file/Orthanc-1.9.7/OrthancServer/Resources/Samples/ImportDicomFiles/OrthancImport.py
